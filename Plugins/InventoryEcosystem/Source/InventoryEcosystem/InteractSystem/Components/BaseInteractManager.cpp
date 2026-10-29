@@ -1,0 +1,626 @@
+﻿// Fill out your copyright notice in the Description page of Project Settings.
+
+
+#include "BaseInteractManager.h"
+
+#include "InteractAnimationComponent.h"
+#include "TimerManager.h"
+#include "Components/CapsuleComponent.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "InventoryEcosystem/InteractSystem/Library/InteractLibrary.h"
+
+#pragma region ENGINE 
+
+UBaseInteractManager::UBaseInteractManager()
+{
+	SetIsReplicatedByDefault(true);
+	SetIsReplicated(true);
+}
+
+void UBaseInteractManager::BeginPlay()
+{
+	Super::BeginPlay();
+	if (!IsLocallyControlled()) return;
+	
+	GetWorld()->GetTimerManager().SetTimer(Timer_InteractTrace, this, &UBaseInteractManager::PerformTrace, (1.f / InteractionCheckFrequency), true);	
+}
+
+void UBaseInteractManager::SetActive(bool bNewActive, bool bReset)
+{
+	if (bNewActive)
+	{
+		if (GetWorld() && !GetWorld()->GetTimerManager().IsTimerActive(Timer_InteractTrace))
+			GetWorld()->GetTimerManager().SetTimer(Timer_InteractTrace, this, &UBaseInteractManager::PerformTrace, (1.f / InteractionCheckFrequency), true);
+	}
+	else
+	{
+		if (GetWorld() && !GetWorld()->GetTimerManager().IsTimerActive(Timer_InteractTrace))
+			GetWorld()->GetTimerManager().ClearTimer(Timer_InteractTrace);
+		InteractionNone();
+	}
+	Super::SetActive(bNewActive, bReset);
+}
+
+void UBaseInteractManager::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+	DOREPLIFETIME(UBaseInteractManager, InteractManagerState);
+}
+
+#pragma endregion ENGINE
+
+#pragma region INPUT
+
+void UBaseInteractManager::InteractPressed()
+{
+	if (!GetCurrentInteractComponent() || !GetOwningPlayerPawn()) return;
+
+	if (!GetCurrentInteractComponent()->CanInteractFor(GetOwningPlayerPawn())) return;
+
+	if (!HasAuthority())
+	{
+		Server_BeginInteract(GetCurrentInteractComponent());
+	}
+
+	BeginInteract();
+}
+
+void UBaseInteractManager::Server_BeginInteract_Implementation(UBaseInteractComponent* InteractComponent)
+{
+	if (!IsValid(InteractComponent)) return;
+	InteractManagerState.SetNewInteractComponent(InteractComponent, UInteractLibrary::GetInteractAnimationComponent(InteractComponent));
+	BeginInteract();
+}
+
+bool UBaseInteractManager::BeginInteract()
+{
+	if (!GetWorld()) return false;
+	if (!GetCurrentInteractComponent()) return false;
+    
+	GetCurrentInteractComponent()->StartInteract(GetOwningPlayerPawn());
+    
+	if (GetCurrentInteractComponent() && GetCurrentInteractComponent()->HasInteractFlag(EInteractType::EIT_Press))
+	{
+		EventPreInteract(GetCurrentInteractComponent(), EInteractType::EIT_Press);
+		return true;
+	}
+    
+	if (GetCurrentInteractComponent() && (GetCurrentInteractComponent()->HasInteractFlag(EInteractType::EIT_Pressed) || GetCurrentInteractComponent()->HasInteractFlag(EInteractType::EIT_CirculPressed)))
+	{
+		FTimerDelegate Delegate;
+		Delegate.BindUFunction(this, TEXT("PressedTimerInteract"), EInteractType::EIT_Pressed);			
+		GetWorld()->GetTimerManager().SetTimer(Timer_InteractPressed, Delegate, GetCurrentInteractComponent()->GetTimeToInteract(), false);
+		return true;
+	}
+	return false;
+}
+
+
+void UBaseInteractManager::InteractReleased()
+{	
+	if (!GetCurrentInteractComponent() || !GetOwningPlayerPawn()) return;
+
+	if (IsCharacterInOtherAction()) return;
+
+	if (!GetCurrentInteractComponent()->CanInteractFor(GetOwningPlayerPawn())) return;
+	if (GetCurrentInteractAnimationComponent() && GetCurrentInteractAnimationComponent()->IsOccupied()) return;
+
+	if (!HasAuthority())
+	{
+		Server_EndInteract(GetCurrentInteractComponent());
+	}
+
+	EndInteract(GetCurrentInteractComponent());
+}
+
+void UBaseInteractManager::Server_EndInteract_Implementation(UBaseInteractComponent* InteractComponent)
+{
+	if (!GetCurrentInteractComponent()) return;
+	EndInteract(InteractComponent);
+}
+
+void UBaseInteractManager::EndInteract(UBaseInteractComponent* InteractComponent)
+{
+	if (GetWorld() && GetWorld()->GetTimerManager().IsTimerActive(Timer_InteractPressed))
+	{
+		GetWorld()->GetTimerManager().ClearTimer(Timer_InteractPressed);
+	}
+    
+	if (InteractComponent && InteractComponent->HasInteractFlag(EInteractType::EIT_Release) && (InteractComponent->GetTimeToInteract() - 0.1f) >= 0.f)
+	{
+		EventPreInteract(InteractComponent, EInteractType::EIT_Release);
+	}
+	if (InteractComponent && InteractComponent->HasInteractFlag(EInteractType::EIT_Released))
+	{
+		if ((InteractComponent->GetTimeToInteract() - 0.1f) <= 0.f)
+		{
+			EventPreInteract(InteractComponent, EInteractType::EIT_Released);
+		}
+	}
+	if (InteractComponent)
+		InteractComponent->EndInteract(GetOwningPlayerPawn());
+}
+
+void UBaseInteractManager::EventPreInteract(UBaseInteractComponent* InteractComponent, EInteractType InteractType)
+{
+	if (!IsValid(InteractComponent)) return;
+	
+	CachedTargetInteractType = InteractType;
+	if (!GetCurrentInteractAnimationComponent())
+	{
+		EventInteract(InteractComponent, InteractType);
+		return;
+	}
+	
+	if (InteractManagerState.CurrentInteractState != ECharacterInteractState::ECIS_InteractState)
+	{
+		SwitchInteractState(ECharacterInteractState::ECIS_MovingToInteractPoint);
+		return;
+	}
+	
+	GetCurrentInteractAnimationComponent()->RunInteractAnimation();
+}
+
+
+void UBaseInteractManager::EventInteract(UBaseInteractComponent* InteractComponent, EInteractType InteractType)
+{
+	if (!InteractComponent) return;
+	OnInteracted.Broadcast(GetOwningPlayerPawn(), InteractComponent, InteractType);
+	InteractComponent->Interact(GetOwningPlayerPawn(), InteractType);
+}
+
+void UBaseInteractManager::InteractByNotify()
+{
+	if (!GetCurrentInteractComponent()) return;
+	EventInteract(GetCurrentInteractComponent(), CachedTargetInteractType);
+}
+
+void UBaseInteractManager::PressedTimerInteract(EInteractType Interact)
+{
+	if (GetWorld() && GetWorld()->GetTimerManager().IsTimerActive(Timer_InteractPressed))
+	{
+		GetWorld()->GetTimerManager().ClearTimer(Timer_InteractPressed);
+	}	
+	if (!GetCurrentInteractComponent())	return;	
+
+	if (GetCurrentInteractComponent()->HasInteractFlag(EInteractType::EIT_CirculPressed))
+	{
+		EventInteract(GetCurrentInteractComponent(), EInteractType::EIT_CirculPressed);
+		GetCurrentInteractComponent()->StartInteract(GetOwningPlayerPawn());
+		
+		FTimerDelegate Delegate;
+		Delegate.BindUFunction(this, TEXT("PressedTimerInteract"), Interact);			
+		GetWorld()->GetTimerManager().SetTimer(Timer_InteractPressed, Delegate, GetCurrentInteractComponent()->GetTimeToInteract(), false);
+
+		return;
+	}
+	
+	EventPreInteract(GetCurrentInteractComponent(), Interact);
+}
+#pragma endregion INPUT
+
+#pragma region TRACE
+
+void UBaseInteractManager::PerformTrace()
+{
+	if (!InteractManagerState.CanBeTrace()) return;
+
+	TArray<FHitResult> LHitResults;
+	FInteractDebugData DrawDebugData = FInteractDebugData::MakeDefault(false);
+	FInteractTraceData TraceData(InteractProfile, InteractionSphereSize, GetCameraLocation(), DoCollisionTest(((MaxInteractDistance / 100) * 5)), GetOwningPlayerPawn());
+	
+#if !UE_BUILD_SHIPPING
+	DrawDebugData = FInteractDebugData::MakeDefault(CDrawDebugInteractedLine.GetValueOnGameThread());
+#endif
+
+	//Сначало проверить перед собой, иначе объемный трейс может не дать взаимодействовать при сложной геометрии 
+	if (UInteractLibrary::LineTrace(TraceData, LHitResults, DrawDebugData))
+	{
+		if (UBaseInteractComponent* LTargetInteractComponent = GetInteractionComponent(LHitResults, TraceData.EndVector))
+		{
+			NewInteraction(LTargetInteractComponent);
+			return;
+		}
+	}
+	
+	LHitResults.Reset();
+	if (!UInteractLibrary::PerformTrace(TraceData, LHitResults, DrawDebugData))
+	{
+		InteractionNone();
+		return;
+	}	
+	
+	if (UBaseInteractComponent* LTargetInteractComponent = GetInteractionComponent(LHitResults, TraceData.EndVector))
+	{
+		NewInteraction(LTargetInteractComponent);
+		return;
+	}
+	
+	InteractionNone();
+}
+
+#pragma endregion TRACE
+
+#pragma region INTERACT_STATE
+
+void UBaseInteractManager::InteractionNone()
+{
+	if (!GetCurrentInteractComponent()) return;
+	
+	//Потенциально у нас может смениться LastInteractComponent при вызове OnInteractFocusLost или EndInteract, поэтому тут кешируется тот компонент с которым надо закончить работу
+	UBaseInteractComponent* LLostInteractComponent = GetCurrentInteractComponent();
+	InteractManagerState.SetNewInteractComponent(nullptr, nullptr);
+
+	if (GetWorld() && GetWorld()->GetTimerManager().IsTimerActive(Timer_InteractPressed))
+	{
+		GetWorld()->GetTimerManager().ClearTimer(Timer_InteractPressed);
+	}
+
+	LLostInteractComponent->EndInteract(GetOwningPlayerPawn());
+	LLostInteractComponent->EndFocus(GetOwningPlayerPawn());
+	OnFocusLost.Broadcast(GetOwningPlayerPawn(), LLostInteractComponent, LLostInteractComponent->GetOwner());
+	
+	if (!HasAuthority())
+	{
+		Server_EndFocus(LLostInteractComponent);
+	}
+}
+
+void UBaseInteractManager::Server_EndFocus_Implementation(UBaseInteractComponent* InteractComp)
+{
+	OnFocusLost.Broadcast(GetOwningPlayerPawn(), InteractComp, InteractComp->GetOwner());	
+}
+
+void UBaseInteractManager::NewInteraction(UBaseInteractComponent* InteractComponent)
+{
+	if (!IsValid(InteractComponent)) return;
+	if (GetCurrentInteractComponent() == InteractComponent) return;
+	
+	InteractionNone();
+	
+	if (!HasAuthority())
+	{
+		Server_BeginFocus(InteractComponent);
+	}
+	
+	InteractManagerState.SetNewInteractComponent(InteractComponent, UInteractLibrary::GetInteractAnimationComponent(InteractComponent));
+	OnBeginFocus.Broadcast(GetOwningPlayerPawn(), InteractComponent, InteractComponent->GetOwner());
+	
+	if (!GetCurrentInteractComponent()) return;
+
+	GetCurrentInteractComponent()->BeginFocus(GetOwningPlayerPawn());
+}
+
+void UBaseInteractManager::Server_BeginFocus_Implementation(UBaseInteractComponent* InteractComp)
+{
+	OnBeginFocus.Broadcast(GetOwningPlayerPawn(), InteractComp, InteractComp->GetOwner());	
+}
+
+#pragma endregion INTERACT_STATE
+
+
+#pragma region TOOLS
+
+UBaseInteractComponent* UBaseInteractManager::GetInteractionComponent(TArray<FHitResult> Hits, FVector HitLocation,	bool IgnorePriority)
+{
+	float LDistance = 1000.f;
+	UBaseInteractComponent* LPossibleInteractComponent = nullptr;
+
+	TMap<UBaseInteractComponent*, FHitResult> Input;
+	for (auto Hit : Hits)
+	{
+		AActor* TargetActor = Hit.GetActor();
+		if (!IsValid(TargetActor)) continue;
+		
+		//Дистанция больше максимальной
+		float Distance = FVector::Distance(GetOwningPlayerPawn()->GetActorLocation(), TargetActor->GetActorLocation());
+		if (Distance > MaxInteractDistance) continue;
+	
+		TArray<UBaseInteractComponent*> LInteractComponents;
+		TargetActor->GetComponents<UBaseInteractComponent>(LInteractComponents);
+	
+		for (auto LInteractComponent : LInteractComponents)
+		{
+			if (!IsValid(LInteractComponent)) continue;
+	
+			Distance = FVector::Distance(GetOwningPlayerPawn()->GetActorLocation(), LInteractComponent->GetComponentLocation());
+			if (Distance > LInteractComponent->GetInteractSettings().InteractionDistance) continue;
+	
+			Input.Add(LInteractComponent, Hit);
+		}
+	}
+	
+	for (auto Pair : Input)
+	{
+		if (!LPossibleInteractComponent)
+		{
+			LPossibleInteractComponent = Pair.Key;
+			LDistance = FVector::Distance(LPossibleInteractComponent->GetOwner()->GetActorLocation(), HitLocation);
+			continue;
+		}
+		
+		if (FVector::Distance(Pair.Key->GetOwner()->GetActorLocation(), HitLocation) < LDistance) // New = nearest ->  NewPossible
+		{
+			LDistance = FVector::Distance(Pair.Value.Location, HitLocation);
+	
+			LPossibleInteractComponent = Pair.Key;
+		}
+	}
+	return LPossibleInteractComponent;
+}
+
+bool UBaseInteractManager::IsNeedMoving()
+{
+	if (!GetCurrentInteractComponent()) return false;
+	if (!GetOwningPlayerPawn()) return false;
+	if (GetCurrentInteractAnimationComponent()->GetPositionType() == EInteractPositionType::EIPT_None) return false;
+	
+	return (!UKismetMathLibrary::EqualEqual_Vector2DVector2D(FVector2D(GetOwningPlayerPawn()->GetActorLocation()), FVector2D(GetCurrentInteractAnimationComponent()->GetInteractTransform(false).GetLocation()), 5.f));
+}
+
+UBaseInteractManager* UBaseInteractManager::GetInteractManager(AActor* FromActor)
+{
+	if (!IsValid(FromActor)) return nullptr;
+	return Cast<UBaseInteractManager>(FromActor->GetComponentByClass(UBaseInteractManager::StaticClass()));
+}
+
+AActor* UBaseInteractManager::GetInteractedActor()
+{
+	if (!(GetCurrentInteractComponent() && (GetCurrentInteractComponent() && GetCurrentInteractComponent()->GetOwner()))) return nullptr;
+
+	if ((FVector::Distance(GetCurrentInteractComponent()->GetOwner()->GetActorLocation(), GetOwningPlayerPawn()->GetActorLocation()) < (MaxInteractDistance + 100.f)))
+	{
+		return GetCurrentInteractComponent()->GetOwner();
+	}
+	else
+	{
+		InteractManagerState.SetNewInteractComponent(nullptr, nullptr);
+		return nullptr;
+	}
+}
+
+UCameraComponent* UBaseInteractManager::GetCameraComponent()
+{
+	if (PlayerCameraComponent) return PlayerCameraComponent;
+	if (!GetOwningPlayerPawn()) return nullptr;
+	
+	PlayerCameraComponent = Cast<UCameraComponent>(GetOwningPlayerPawn()->GetComponentByClass(UCameraComponent::StaticClass()));
+	return PlayerCameraComponent;
+}
+FVector UBaseInteractManager::GetCameraLocation()
+{
+	if (GetOwningPlayerController() && GetOwningPlayerController()->PlayerCameraManager)
+	{
+		return GetOwningPlayerController()->PlayerCameraManager->GetCameraLocation();
+	}
+	else if (GetCameraComponent())
+	{
+		return GetCameraComponent()->GetComponentLocation();
+	}
+	return FVector::ZeroVector;
+}
+
+FVector UBaseInteractManager::GetCameraForwardVector()
+{
+	if (GetOwningPlayerController() && GetOwningPlayerController()->PlayerCameraManager)
+	{
+		return GetOwningPlayerController()->PlayerCameraManager->GetCameraRotation().Vector();
+	}
+	if (GetCameraComponent())
+	{
+		return GetCameraComponent()->GetForwardVector();
+	}
+	return FVector::ZeroVector;
+}
+
+FVector UBaseInteractManager::GetEndVector()
+{
+	return (GetCameraLocation() + GetCameraForwardVector() * MaxInteractDistance);
+}
+
+bool UBaseInteractManager::DoCollisionTestHit(FHitResult& OutHitResult, float AppendVector)
+{
+	FCollisionQueryParams LCQP;
+	LCQP.AddIgnoredActor(GetOwningPlayerPawn());
+	return GetWorld()->LineTraceSingleByChannel(OutHitResult, GetCameraLocation(), GetEndVector(), ECollisionChannel::ECC_Visibility, LCQP);
+}
+
+FVector UBaseInteractManager::DoCollisionTest(float AppendVector)
+{
+	FHitResult HitResult;
+	bool LResult = DoCollisionTestHit(HitResult, AppendVector);
+	return (LResult ? HitResult.Location : GetEndVector());
+}
+
+#pragma endregion TOOLS
+
+
+#pragma region InteractStateMachine
+
+void UBaseInteractManager::CancelInteraction()
+{
+	if (IsNetMode(ENetMode::NM_Standalone))
+	{
+		SwitchInteractState(ECharacterInteractState::ECIS_None);
+		return;
+	}
+	
+	if (IsLocallyControlled() && !HasAuthority()) //ListenServer
+	{
+		Server_CancelInteraction();
+		SwitchInteractState(ECharacterInteractState::ECIS_None);
+	}
+	
+	if (HasAuthority())
+	{
+		Client_CancelInteraction();
+		SwitchInteractState(ECharacterInteractState::ECIS_None);
+		return;
+	}
+}
+
+void UBaseInteractManager::Server_CancelInteraction_Implementation()
+{
+	SwitchInteractState(ECharacterInteractState::ECIS_None);
+}
+
+void UBaseInteractManager::Client_CancelInteraction_Implementation()
+{
+	SwitchInteractState(ECharacterInteractState::ECIS_None);
+}
+
+bool UBaseInteractManager::SwitchInteractState(ECharacterInteractState NewState)
+{
+	InteractManagerState.OldInteractState = InteractManagerState.CurrentInteractState;
+	InteractManagerState.CurrentInteractState = NewState;
+	if (NewState != ECharacterInteractState::ECIS_None && GetCurrentInteractComponent())
+	{
+		GetCurrentInteractComponent()->DeactivateOutLine();
+		OnFocusLost.Broadcast(GetOwningPlayerPawn(), GetCurrentInteractComponent(), GetCurrentInteractComponent()->GetOwner());
+	}
+	switch (NewState)
+	{
+	case ECharacterInteractState::ECIS_None:
+	{
+		if (InteractManagerState.OldInteractState == ECharacterInteractState::ECIS_MovingToInteractPoint) // В случае если было вызвано BreakCurrentInteraction
+		{
+			GetWorld()->GetTimerManager().ClearTimer(Timer_MoveTo);
+		}
+		if (InteractManagerState.OldInteractState == ECharacterInteractState::ECIS_InteractState && GetCurrentInteractComponent() && GetCurrentInteractAnimationComponent()) // В случае если было вызвано BreakCurrentInteraction
+		{
+			GetCurrentInteractAnimationComponent()->EndInteraction(GetOwningPlayerPawn());
+			GetOwner()->SetActorTransform(GetCurrentInteractAnimationComponent()->GetInteractTransform());
+			
+			if (HasAuthority() && !IsNetMode(ENetMode::NM_Standalone)) //Dedicated | Listen Server
+			{
+				NetMulticast_CancelAnimation(GetCurrentInteractAnimationComponent());
+			}
+		}
+		AnimationInteractSuccessfull(); //Состояние интеракта выключено
+		InteractManagerState.TargetInteractState = ECharacterInteractState::ECIS_None;
+		InteractManagerState.CurrentInteractStateTag = FGameplayTag();
+		if (GetCurrentInteractComponent())
+		{
+			GetCurrentInteractComponent()->ActivateOutLine();
+			OnBeginFocus.Broadcast(GetOwningPlayerPawn(), GetCurrentInteractComponent(), GetCurrentInteractComponent()->GetOwner());
+		}
+		OnInteractManagerStateChange.Broadcast(this);
+		return true;
+	}
+	case ECharacterInteractState::ECIS_MovingToInteractPoint:
+	{
+		return MoveToInteractPoint();
+	}
+	case ECharacterInteractState::ECIS_AwaitPlayerInput:
+	{
+		if (!GetCurrentInteractComponent()->GetOwner()) return false;
+		return true;
+	}
+	case ECharacterInteractState::ECIS_InteractState:
+	{
+		if (GetCurrentInteractComponent() && GetCurrentInteractAnimationComponent())
+		{
+			GetCurrentInteractAnimationComponent()->OnInteracted.AddUniqueDynamic(this, &ThisClass::OnAnimationCompleted);
+			InteractManagerState.CurrentInteractStateTag = GetCurrentInteractAnimationComponent()->GetInteractState();
+			OnInteractManagerStateChange.Broadcast(this);
+			GetCurrentInteractAnimationComponent()->StartInteraction(GetOwningPlayerPawn());
+			if (HasAuthority() && !IsNetMode(ENetMode::NM_Standalone)) //Dedicated | Listen Server
+			{
+				NetMulticast_RunAnimation(GetCurrentInteractAnimationComponent());
+			}
+		}
+		return true;
+	}
+	default:
+		break;
+	}
+	return false;
+}
+
+void UBaseInteractManager::NetMulticast_RunAnimation_Implementation(UInteractAnimationComponent* InteractComp)
+{
+	if (!InteractComp) return;
+	if (IsLocallyControlled() || HasAuthority()) return;
+	
+	InteractComp->StartInteraction(GetOwningPlayerPawn());
+}
+
+void UBaseInteractManager::NetMulticast_CancelAnimation_Implementation(UInteractAnimationComponent* InteractComp)
+{
+	if (!InteractComp) return;
+	if (IsLocallyControlled() || HasAuthority()) return;
+	
+	InteractComp->EndInteraction(GetOwningPlayerPawn());
+}
+
+void UBaseInteractManager::OnAnimationCompleted(APawn* InCharacterInstigator, UInteractAnimationComponent* InteractAnimComponent, UAnimationInteractRule* InteractRules)
+{
+	if (InCharacterInstigator != GetOwner()) return;
+	if (!GetCurrentInteractComponent()) return;
+	EventInteract(GetCurrentInteractComponent(), CachedTargetInteractType);
+	
+	if (InteractManagerState.CurrentInteractStateTag != FGameplayTag()) return;
+
+	CancelInteraction();
+}
+
+bool UBaseInteractManager::MoveToInteractPoint()
+{
+	InteractManagerState.TargetInteractState = ECharacterInteractState::ECIS_InteractState;
+
+	GetCapsuleComponent()->SetCapsuleRadius(10.f);
+	GetWorld()->GetTimerManager().SetTimer(Timer_MoveTo, this, &UBaseInteractManager::MoveTo, 0.01f, true);
+	return true;
+}
+
+void UBaseInteractManager::AnimationInteractSuccessfull(){}
+
+void UBaseInteractManager::NextInteractState() //Запустить следующие состояние State машины
+{
+	SwitchInteractState(InteractManagerState.TargetInteractState);
+}
+
+
+void UBaseInteractManager::MoveTo()
+{
+	if (!GetOwningPlayerPawn() || !GetCurrentInteractComponent())
+	{
+		GetWorld()->GetTimerManager().ClearTimer(Timer_MoveTo);
+		MoveEnd();
+		return;
+	}
+
+
+	float LTolerance = (GetCurrentInteractAnimationComponent()->GetPositionType() == EInteractPositionType::EIPT_Point ? 15.f : GetCurrentInteractAnimationComponent()->GetInteractRadius());
+
+	if (UKismetMathLibrary::EqualEqual_Vector2DVector2D(FVector2D(GetOwningPlayerPawn()->GetActorLocation()), FVector2D(GetCurrentInteractAnimationComponent()->GetInteractTransform().GetLocation()), LTolerance))
+	{
+		FLatentActionInfo Callback;	Callback.CallbackTarget = this;	Callback.ExecutionFunction = FName("MoveEnd");	Callback.UUID = 0;	Callback.Linkage = 0;
+		if (GetCurrentInteractAnimationComponent()->GetPositionType() == EInteractPositionType::EIPT_Point)
+		{
+			GetOwningPlayerPawn()->GetMovementComponent()->Velocity = FVector::ZeroVector;
+			UKismetSystemLibrary::MoveComponentTo(GetCapsuleComponent(), GetCurrentInteractAnimationComponent()->GetInteractTransform(false).GetLocation(), GetCurrentInteractAnimationComponent()->GetInteractTransform(false).GetRotation().Rotator(), false, false, 0.25f, false, EMoveComponentAction::Move, Callback);
+		}
+		else
+		{
+			MoveEnd();
+		}
+		GetWorld()->GetTimerManager().ClearTimer(Timer_MoveTo);
+
+		return;
+	}
+	FRotator Direction = UKismetMathLibrary::FindLookAtRotation(GetOwningPlayerPawn()->GetActorLocation(), GetCurrentInteractAnimationComponent()->GetInteractTransform(false).GetLocation());
+	GetOwningPlayerPawn()->AddMovementInput(Direction.Vector());
+}
+
+void UBaseInteractManager::MoveEnd()
+{
+	SwitchInteractState(InteractManagerState.TargetInteractState);
+}
+
+#pragma endregion
+
+
+void UBaseInteractManager::OnRep_InteractManagerState()
+{
+	OnInteractManagerStateChange.Broadcast(this);
+}
